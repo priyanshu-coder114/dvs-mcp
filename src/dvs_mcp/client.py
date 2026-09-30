@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import httpx
 
 from dvs_mcp.settings import DvsSettings
 
+logger = logging.getLogger("dvs_mcp")
+
 _client: DvsClient | None = None
+
+_RETRY_STATUS = frozenset({408, 500, 502, 503, 504})
 
 
 class DvsClient:
@@ -43,10 +48,11 @@ class DvsClient:
             with self._client.stream("GET", path, headers={"Accept": "*/*"}) as response:
                 if response.status_code >= 400:
                     raw = response.read()
-                    return {
-                        "status": response.status_code,
-                        "body": _decode_bytes(raw, response.headers.get("content-type", "")),
-                    }
+                    logger.warning("DVS GET %s returned %s", path, response.status_code)
+                    return http_error(
+                        response.status_code,
+                        _decode_bytes(raw, response.headers.get("content-type", "")),
+                    )
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 written = 0
                 try:
@@ -61,10 +67,11 @@ class DvsClient:
                     raise
         except httpx.HTTPError as exc:
             dest.unlink(missing_ok=True)
-            return {"error": str(exc)}
+            logger.warning("DVS GET %s failed: %s", path, exc.__class__.__name__)
+            return transport_error()
         if written == 0:
             dest.unlink(missing_ok=True)
-            return {"error": "DVS returned an empty drops file"}
+            return {"error": "DVS returned an empty drops file", "retry": True}
         return {"bytes": written}
 
     def _headers(self) -> dict[str, str]:
@@ -92,10 +99,12 @@ class DvsClient:
                 json=json_body,
             )
         except httpx.HTTPError as exc:
-            return {"error": str(exc)}
+            logger.warning("DVS %s %s failed: %s", method, path, exc.__class__.__name__)
+            return transport_error()
         body = _decode_response(response)
         if response.status_code >= 400:
-            return {"status": response.status_code, "body": body}
+            logger.warning("DVS %s %s returned %s", method, path, response.status_code)
+            return http_error(response.status_code, body)
         return body
 
 
@@ -128,6 +137,34 @@ def freshness_params(
     if cache_only:
         params["cacheOnly"] = "true"
     return params
+
+
+def transport_error() -> dict[str, Any]:
+    return {"error": "DVS request failed", "retry": True}
+
+
+def http_error(status: int, body: Any) -> dict[str, Any]:
+    message = f"DVS returned HTTP {status}"
+    retry_after = None
+    if isinstance(body, dict):
+        raw = body.get("error") or body.get("message")
+        if isinstance(raw, str) and raw.strip():
+            message = raw.strip()
+        if body.get("retryAfter") is not None:
+            retry_after = body.get("retryAfter")
+        elif body.get("retryAfterMs") is not None:
+            retry_after = body.get("retryAfterMs")
+    if status in (401, 403):
+        message = f"{message}. Set DVS_INTERNAL_TOKEN in the MCP process environment."
+    result: dict[str, Any] = {
+        "error": message,
+        "status": status,
+        "retry": status in _RETRY_STATUS,
+        "body": body,
+    }
+    if retry_after is not None:
+        result["retryAfter"] = retry_after
+    return result
 
 
 def _compact(params: dict[str, Any] | None) -> dict[str, Any] | None:

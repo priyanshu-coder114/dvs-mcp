@@ -5,10 +5,10 @@ from pathlib import Path
 
 import httpx
 
-from dvs_mcp.client import set_client
-from dvs_mcp.client import DvsClient
+from dvs_mcp.client import DvsClient, set_client
+from dvs_mcp.server import mcp
 from dvs_mcp.settings import DvsSettings
-from dvs_mcp.tools.estibot import estibot_appraisal, estibot_siteinfo, fetch_drops
+from dvs_mcp.tools.estibot import estibot_appraisal, estibot_drops_status, estibot_siteinfo, fetch_drops, poll_drops
 from dvs_mcp.tools.godaddy import godaddy_govalue, godaddy_govalue_bulk
 
 
@@ -19,7 +19,8 @@ def _settings(**overrides) -> DvsSettings:
         "source": "dashboard",
         "platform_type": "AMP2",
         "system_actor": "mcp",
-        "drops_wait_seconds": 240,
+        "drops_wait_seconds": 25,
+        "drops_output_dir": Path("output/estibot-drops"),
     }
     values.update(overrides)
     return DvsSettings(**values)
@@ -117,7 +118,11 @@ def test_rate_limit_is_returned_as_status_and_body() -> None:
     _client, _seen = _use(handler, _settings(token=None))
     result = godaddy_govalue("example.com")
 
-    assert result == {"status": 429, "body": body}
+    assert result["status"] == 429
+    assert result["error"] == "Rate limit exceeded"
+    assert result["retryAfter"] == 86400
+    assert result["retry"] is False
+    assert result["body"] == body
     assert "x-internal-token" not in _seen[0].headers
 
 
@@ -227,7 +232,8 @@ def test_drops_timeout_returns_job_without_calling_estibot_again() -> None:
 
     assert result["status"] == "downloading"
     assert result["jobId"] == "job-9"
-    assert "same list and date" in result["message"]
+    assert "error" not in result
+    assert "estibot_drops_status" in result["message"]
     assert seen[-1].url.path == "/estibot/drops/fetch/job-9"
     assert all("estibot.com" not in str(request.url) for request in seen)
 
@@ -290,15 +296,162 @@ def test_tools_register() -> None:
         "estibot_appraisal",
         "estibot_siteinfo",
         "estibot_drops",
+        "estibot_drops_status",
         "godaddy_govalue",
         "godaddy_govalue_bulk",
     }
     assert all(tool.output_schema is None for tool in tools)
+    lookups = {"estibot_appraisal", "estibot_siteinfo", "godaddy_govalue", "godaddy_govalue_bulk"}
+    for tool in tools:
+        assert tool.annotations is not None
+        if tool.name in lookups:
+            assert tool.annotations.read_only_hint is True
+        else:
+            assert tool.annotations.read_only_hint is False
+
+    appraisal = next(tool for tool in tools if tool.name == "estibot_appraisal")
+    drops = next(tool for tool in tools if tool.name == "estibot_drops")
+    siteinfo = next(tool for tool in tools if tool.name == "estibot_siteinfo")
+    assert "paid" in appraisal.parameters["properties"]["force_live"]["description"]
+    assert "Drop list" in drops.parameters["properties"]["drop_list"]["description"]
+    assert "bare domain" in siteinfo.parameters["properties"]["domain"]["description"]
+    assert mcp.instructions
+    assert "example.com" in mcp.instructions
+    assert "estibot_drops_status" in mcp.instructions
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=[{"domain": "a.com"}, {"domain": "b.com"}])
 
     _use(handler)
-    appraisal = next(tool for tool in tools if tool.name == "estibot_appraisal")
     encoded = appraisal.fn(["a.com", "b.com"])
     assert json.loads(encoded) == [{"domain": "a.com"}, {"domain": "b.com"}]
+
+
+def test_invalid_domain_and_oversized_batch_do_not_call_dvs() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("DVS should not be called")
+
+    _client, seen = _use(handler)
+    invalid = estibot_appraisal(["https://not a domain"])
+    oversized = godaddy_govalue_bulk([f"d{i}.com" for i in range(51)])
+
+    assert invalid == {"error": "invalid domain: https://not a domain"}
+    assert oversized == {"error": "at most 50 domains are allowed"}
+    assert seen == []
+
+
+def test_domain_url_is_normalized_before_lookup() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"domain": "example.com"})
+
+    _client, seen = _use(handler)
+    estibot_appraisal(["https://Example.COM/path?q=1"])
+
+    assert _query(seen[0])["d"] == "example.com"
+
+
+def test_auth_failure_tells_the_agent_to_set_the_token() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "unauthorized"})
+
+    _client, _seen = _use(handler, _settings(token=None))
+    result = godaddy_govalue("example.com")
+
+    assert result["status"] == 401
+    assert result["retry"] is False
+    assert "DVS_INTERNAL_TOKEN" in result["error"]
+    assert result["body"] == {"error": "unauthorized"}
+
+
+def test_drops_status_downloads_ready_job_without_post(tmp_path: Path) -> None:
+    payload = b"PK\x03\x04zip"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            raise AssertionError("status must not start a job")
+        if request.url.path == "/estibot/drops/fetch/job-1":
+            return httpx.Response(200, json={"jobId": "job-1", "status": "ready"})
+        if request.url.path == "/estibot/drops/fetch/job-1/file":
+            return httpx.Response(200, content=payload, headers={"content-type": "application/zip"})
+        return httpx.Response(500, json={"path": request.url.path})
+
+    _client, seen = _use(handler, _settings(drops_output_dir=tmp_path))
+    result = estibot_drops_status("job-1", "dynadot", "2026-09-28")
+
+    assert result["status"] == "ready"
+    assert result["bytes"] == len(payload)
+    written = Path(result["path"])
+    assert written.is_absolute()
+    assert written.parent == tmp_path.resolve()
+    assert written.read_bytes() == payload
+    assert [request.method for request in seen] == ["GET", "GET"]
+
+
+def test_drops_status_still_running_keeps_the_job_id() -> None:
+    clock = {"now": 0.0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            raise AssertionError("status must not start a job")
+        return httpx.Response(200, json={"jobId": "job-9", "status": "downloading"})
+
+    def monotonic() -> float:
+        clock["now"] += 100
+        return clock["now"]
+
+    client, _seen = _use(handler)
+    result = poll_drops(
+        "job-9",
+        "dynadot",
+        "2026-09-28",
+        client=client,
+        wait_seconds=50,
+        poll_interval=3,
+        sleep=lambda _seconds: None,
+        monotonic=monotonic,
+    )
+
+    assert result["status"] == "downloading"
+    assert result["jobId"] == "job-9"
+    assert "error" not in result
+    assert "estibot_drops_status" in result["message"]
+
+
+def test_unsafe_job_id_does_not_call_dvs() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("DVS should not be called")
+
+    _client, seen = _use(handler)
+    result = estibot_drops_status("../job", "dynadot", "2026-09-28")
+
+    assert result == {"error": "invalid drops job id"}
+    assert seen == []
+
+
+def test_drops_output_dir_comes_from_settings(tmp_path: Path) -> None:
+    payload = b"PK\x03\x04zip"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(202, json={"jobId": "job-3", "status": "queued"})
+        if request.url.path.endswith("/file"):
+            return httpx.Response(200, content=payload, headers={"content-type": "application/zip"})
+        return httpx.Response(200, json={"jobId": "job-3", "status": "ready"})
+
+    client, _seen = _use(handler, _settings(drops_output_dir=tmp_path))
+    result = fetch_drops("dynadot", "2026-09-28", client=client, poll_interval=0)
+
+    written = Path(result["path"])
+    assert written.is_absolute()
+    assert written.parent == tmp_path.resolve()
+    assert written.read_bytes() == payload
+
+
+def test_default_drops_wait_and_output_dir(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("DVS_DROPS_WAIT_SECONDS", raising=False)
+    monkeypatch.delenv("DVS_DROPS_OUTPUT_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    settings = DvsSettings.from_env()
+
+    assert settings.drops_wait_seconds == 25
+    assert settings.drops_output_dir == (tmp_path / "output" / "estibot-drops").resolve()

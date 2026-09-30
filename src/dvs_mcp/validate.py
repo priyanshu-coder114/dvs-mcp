@@ -15,7 +15,10 @@ ALLOWED_DROP_LISTS = frozenset(
     }
 )
 
+MAX_DOMAINS = 50
+
 _UNSAFE_FILENAME = re.compile(r"[^A-Za-z0-9._ -]+")
+_DOMAIN = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$")
 
 
 class InputError(Exception):
@@ -28,18 +31,27 @@ def error_result(exc: InputError) -> dict:
     return {"error": exc.message}
 
 
-def normalize_domains(domains: list[str]) -> list[str]:
-    cleaned = [domain.strip() for domain in domains if domain and domain.strip()]
-    if not cleaned:
-        raise InputError("at least one domain is required")
-    return cleaned
-
-
 def normalize_domain(domain: str) -> str:
-    cleaned = domain.strip()
-    if not cleaned:
-        raise InputError("domain is required")
+    cleaned = domain.strip().lower()
+    if cleaned.startswith("https://"):
+        cleaned = cleaned[len("https://") :]
+    elif cleaned.startswith("http://"):
+        cleaned = cleaned[len("http://") :]
+    cleaned = cleaned.split("/")[0].split("?")[0].split("#")[0]
+    if cleaned.endswith("."):
+        cleaned = cleaned[:-1]
+    if not cleaned or not _DOMAIN.fullmatch(cleaned):
+        raise InputError(f"invalid domain: {domain.strip()}")
     return cleaned
+
+
+def normalize_domains(domains: list[str]) -> list[str]:
+    present = [domain for domain in domains if domain and domain.strip()]
+    if not present:
+        raise InputError("at least one domain is required")
+    if len(present) > MAX_DOMAINS:
+        raise InputError(f"at most {MAX_DOMAINS} domains are allowed")
+    return [normalize_domain(domain) for domain in present]
 
 
 def check_max_age(max_age_days: int | None, force_live: bool) -> int | None:
@@ -78,8 +90,15 @@ def normalize_drop_type(value: str) -> str:
     return cleaned or "complete"
 
 
+def normalize_job_id(job_id: str) -> str:
+    cleaned = job_id.strip()
+    if not cleaned or "/" in cleaned or ".." in cleaned:
+        raise InputError("invalid drops job id")
+    return cleaned
+
+
 def drop_destination(output_dir: Path, drop_list: str, drop_date: str) -> Path:
-    root = output_dir.resolve()
+    root = output_dir.expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     cleaned = _UNSAFE_FILENAME.sub("-", drop_list).replace("..", "").strip(" .-")
     if not cleaned:
