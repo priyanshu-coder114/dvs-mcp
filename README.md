@@ -91,6 +91,8 @@ Pass bare domains such as `example.com`, not URLs.
 | `godaddy_govalue_bulk` | GoDaddy GoValue for more than one domain, at most 50 per call |
 | `estibot_drops` | Start a drop-list download. May return a `jobId` before the ZIP exists. |
 | `estibot_drops_status` | Check that `jobId` and download the ZIP when it is ready |
+| `usage` | Usage for every upstream API. Omit `date` for today, or pass `yyyy-MM-dd`. |
+| `domainiq_usage` | DomainIQ usage, including operations and calls by source. Same `date` rule. |
 
 Leave `force_live` false unless you want a new paid vendor lookup. `force_live` spends vendor quota and cannot be combined with `max_age_days` or `cache_only`. Use `cache_only` when a cache miss must not call the vendor.
 

@@ -10,6 +10,7 @@ from dvs_mcp.server import mcp
 from dvs_mcp.settings import DvsSettings
 from dvs_mcp.tools.estibot import estibot_appraisal, estibot_drops_status, estibot_siteinfo, fetch_drops, poll_drops
 from dvs_mcp.tools.godaddy import godaddy_govalue, godaddy_govalue_bulk
+from dvs_mcp.tools.usage import domainiq_usage, usage
 
 
 def _settings(**overrides) -> DvsSettings:
@@ -286,10 +287,12 @@ def test_tools_register() -> None:
 
     from dvs_mcp.tools.estibot import register as register_estibot
     from dvs_mcp.tools.godaddy import register as register_godaddy
+    from dvs_mcp.tools.usage import register as register_usage
 
     server = MCPServer("dvs-test")
     register_estibot(server)
     register_godaddy(server)
+    register_usage(server)
     tools = list(server._tool_manager.list_tools())
     names = {tool.name for tool in tools}
     assert names == {
@@ -299,9 +302,18 @@ def test_tools_register() -> None:
         "estibot_drops_status",
         "godaddy_govalue",
         "godaddy_govalue_bulk",
+        "usage",
+        "domainiq_usage",
     }
     assert all(tool.output_schema is None for tool in tools)
-    lookups = {"estibot_appraisal", "estibot_siteinfo", "godaddy_govalue", "godaddy_govalue_bulk"}
+    lookups = {
+        "estibot_appraisal",
+        "estibot_siteinfo",
+        "godaddy_govalue",
+        "godaddy_govalue_bulk",
+        "usage",
+        "domainiq_usage",
+    }
     for tool in tools:
         assert tool.annotations is not None
         if tool.name in lookups:
@@ -318,6 +330,8 @@ def test_tools_register() -> None:
     assert mcp.instructions
     assert "example.com" in mcp.instructions
     assert "estibot_drops_status" in mcp.instructions
+    assert "usage" in mcp.instructions
+    assert "domainiq_usage" in mcp.instructions
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=[{"domain": "a.com"}, {"domain": "b.com"}])
@@ -455,3 +469,61 @@ def test_default_drops_wait_and_output_dir(monkeypatch, tmp_path: Path) -> None:
 
     assert settings.drops_wait_seconds == 25
     assert settings.drops_output_dir == (tmp_path / "output" / "estibot-drops").resolve()
+
+
+def test_usage_omits_date_for_today() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"apis": [{"apiType": "gdv"}]})
+
+    _client, seen = _use(handler)
+    result = usage()
+
+    assert result["apis"][0]["apiType"] == "gdv"
+    request = seen[0]
+    assert request.method == "GET"
+    assert request.url.path == "/usage"
+    assert "date" not in _query(request)
+
+
+def test_usage_and_domainiq_send_the_date() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"date": "2026-10-01"})
+
+    _client, seen = _use(handler)
+    usage("2026-10-01")
+    domainiq_usage(" 2026-10-01 ")
+
+    assert seen[0].method == "GET"
+    assert seen[0].url.path == "/usage"
+    assert _query(seen[0]) == {"date": "2026-10-01"}
+    assert seen[1].method == "GET"
+    assert seen[1].url.path == "/usage/domainiq"
+    assert _query(seen[1]) == {"date": "2026-10-01"}
+
+
+def test_bad_usage_date_does_not_call_dvs() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("DVS should not be called")
+
+    _client, seen = _use(handler)
+    result = usage("10/01/2026")
+    domainiq = domainiq_usage("yesterday")
+
+    assert result == {"error": "date must be yyyy-MM-dd"}
+    assert domainiq == {"error": "date must be yyyy-MM-dd"}
+    assert seen == []
+
+
+def test_usage_http_400_is_not_retried() -> None:
+    body = {"error": "Unknown apiType nope. Use one of [gdv, estap, estsiteinfo, estleads, dotdb, domainiq]"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json=body)
+
+    _client, _seen = _use(handler)
+    result = domainiq_usage()
+
+    assert result["status"] == 400
+    assert result["retry"] is False
+    assert result["error"] == body["error"]
+    assert result["body"] == body

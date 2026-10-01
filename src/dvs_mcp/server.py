@@ -8,6 +8,7 @@ Use godaddy_govalue for one domain and godaddy_govalue_bulk for more than one, a
 Leave force_live false unless the user explicitly asks for a new paid lookup. force_live spends vendor quota and cannot be combined with max_age_days or cache_only.
 Use cache_only when a cache miss must not call the vendor.
 estibot_drops starts a drop-list download and may return a jobId before the ZIP exists. Then call estibot_drops_status with that jobId. The ZIP is saved on the machine running this server; the path in the result is a local absolute path.
+Use usage for every upstream API and domainiq_usage for DomainIQ only. Omit date for today, or pass yyyy-MM-dd.
 If a tool result has "retry": false, do not call that tool again in this turn.
 """.strip()
 
@@ -18,7 +19,9 @@ def main() -> None:
     load_dotenv()
     from dvs_mcp.tools.estibot import register as register_estibot
     from dvs_mcp.tools.godaddy import register as register_godaddy
+    from dvs_mcp.tools.usage import register as register_usage
 
     register_estibot(mcp)
     register_godaddy(mcp)
+    register_usage(mcp)
     mcp.run(transport="stdio")
